@@ -40,7 +40,6 @@ class ReadableStream {
     [[queue]]
     [[started]] = false
     [[draining]] = false
-    [[pulling]] = false
     [[state]] = "waiting"
     [[storedError]]
     [[waitPromise]]
@@ -56,6 +55,7 @@ class ReadableStream {
     [[enqueue]](any chunk)
     [[close]]()
     [[error]](any e)
+    [[amountWritable]]()
 
     // Other internal helper methods
     [[callOrSchedulePull]]()
@@ -88,7 +88,7 @@ Both `start` and `pull` are given the ability to manipulate the stream's interna
 1. Let `this.[[waitPromise]]` be a new promise.
 1. Let `this.[[closedPromise]]` be a new promise.
 1. Let `this.[[queue]]` be a new empty List.
-1. Let _startResult_ be the result of `start(this.[[enqueue]], this.[[close]], this.[[error]])`.
+1. Let _startResult_ be the result of `start(this.[[enqueue]], this.[[close]], this.[[error]], this.[[amountQueuable]])`.
 1. ReturnIfAbrupt(_startResult_).
 1. Let `this.[[startedPromise]]` be the result of resolving _startResult_ as a promise.
 1. Upon fulfillment of `this.[[startedPromise]]`, set `this.[[started]]` to **true**.
@@ -110,10 +110,11 @@ Both `start` and `pull` are given the ability to manipulate the stream's interna
         1. Set `this.[[state]]` to `"closed"`.
         1. Let `this.[[waitPromise]]` be a new promise resolved with **undefined**.
         1. Resolve `this.[[closedPromise]]` with **undefined**.
+        1. Return `chunk`
     1. If `this.[[draining]]` is **false**,
         1. Set `this.[[state]]` to `"waiting"`.
         1. Let `this.[[waitPromise]]` be a new promise.
-        1. Call `this.[[callOrSchedulePull]]()`.
+1. Call `this.[[callOrSchedulePull]]()`.
 1. Return `chunk`.
 
 ##### wait()
@@ -164,7 +165,7 @@ For now, please consider the reference implementation normative: [reference-impl
 1. EnqueueValueWithSize(`this.[[queue]]`, `chunk`, _chunkSize_.[[value]]).
 1. Set `this.[[pulling]]` to **false**.
 1. Let _queueSize_ be GetTotalQueueSize(`this.[[queue]]`).
-1. Let _needsMore_ be ToBoolean(Invoke(`this.[[strategy]]`, `"needsMore"`, (_queueSize_))).
+1. Let _needsMore_ be ToBoolean(Invoke(`this.[[strategy]]`, `"onEnqueue"`, (_queueSize_))).
 1. If _needsMore_ is an abrupt completion,
     1. Call `this.[[error]](_needsMore_.[[value]])`.
     1. Return **false**.
@@ -198,16 +199,26 @@ For now, please consider the reference implementation normative: [reference-impl
 
 ##### `[[callOrSchedulePull]]()`
 
-1. If `this.[[pulling]]` is **true**, return.
-1. Set `this.[[pulling]]` to **true**.
+1. Let `pullResult` be the result of `this.[[onPull]](this.[[enqueue]], this.[[close]], this.[[error]], this.[[amountQueuable]])`.
+1. If `pullResult` is an abrupt completion, call `this.[[error]](pullResult.[[value]])`.
+
+##### `[[callOrSchedulePull]]()`
+
 1. If `this.[[started]]` is **false**,
-    1. Upon fulfillment of `this.[[startedPromise]]`, call `this.[[callPull]]`.
-1. If `this.[[started]]` is **true**, call `this.[[callPull]]`.
+    1. Upon fulfillment of `this.[[startedPromise]]`, call `this.[[callPull]]()`.
+1. If `this.[[started]]` is **true**, call `this.[[callPull]]()`.
 
 ##### `[[callPull]]()`
 
 1. Let `pullResult` be the result of `this.[[onPull]](this.[[enqueue]], this.[[close]], this.[[error]])`.
 1. If `pullResult` is an abrupt completion, call `this.[[error]](pullResult.[[value]])`.
+
+##### `[[amountQueuable]]()`
+
+1. if `this.[[state]]` is `"errored"` or `"closed"`,
+    1. Return 0.
+1. Let _queueSize_ be GetTotalQueueSize(`this.[[queue]]`).
+1. Return Invoke(`this.[[strategy]]`, `"amountQueuable"`, (_queueSize_)).
 
 ## Writable Stream APIs
 
@@ -346,6 +357,13 @@ In reaction to calls to the stream's `.write()` method, the `write` constructor 
 ##### wait()
 
 1. Return `this.[[writablePromise]]`.
+
+##### amountWritable()
+
+1. if `this.[[state]]` is `"errored"` or `"closing"` or `"closed"`,
+    1. Return 0.
+1. Let _queueSize_ be GetTotalQueueSize(`this.[[queue]]`).
+1. Return Invoke(`this.[[strategy]]`, `"amountWritable"`, (_queueSize_)).
 
 #### Internal Methods of WritableStream
 
