@@ -197,6 +197,13 @@ For now, please consider the reference implementation normative: [reference-impl
     1. Let `this.[[waitPromise]]` be a new promise rejected with `e`.
     1. Reject `this.[[closedPromise]]` with `e`.
 
+##### `[[amountQueuable]]()`
+
+1. if `this.[[state]]` is `"errored"` or `"closed"`,
+    1. Return 0.
+1. Let _queueSize_ be GetTotalQueueSize(`this.[[queue]]`).
+1. Return Invoke(`this.[[strategy]]`, `"amountQueuable"`, (_queueSize_)).
+
 ##### `[[callOrSchedulePull]]()`
 
 1. Let `pullResult` be the result of `this.[[onPull]](this.[[enqueue]], this.[[close]], this.[[error]], this.[[amountQueuable]])`.
@@ -212,13 +219,6 @@ For now, please consider the reference implementation normative: [reference-impl
 
 1. Let `pullResult` be the result of `this.[[onPull]](this.[[enqueue]], this.[[close]], this.[[error]])`.
 1. If `pullResult` is an abrupt completion, call `this.[[error]](pullResult.[[value]])`.
-
-##### `[[amountQueuable]]()`
-
-1. if `this.[[state]]` is `"errored"` or `"closed"`,
-    1. Return 0.
-1. Let _queueSize_ be GetTotalQueueSize(`this.[[queue]]`).
-1. Return Invoke(`this.[[strategy]]`, `"amountQueuable"`, (_queueSize_)).
 
 ## Writable Stream APIs
 
