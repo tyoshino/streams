@@ -33,8 +33,7 @@ test('Piping through an identity transform stream will close the destination whe
     transform(chunk, enqueue, done) {
       enqueue(chunk);
       done();
-    },
-    outputStrategy: new CountQueuingStrategy({ highWaterMark: 1 })
+    }
   });
 
   var ws = new WritableStream({

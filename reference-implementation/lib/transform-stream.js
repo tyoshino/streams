@@ -1,5 +1,6 @@
 import ReadableStream from './readable-stream';
 import WritableStream from './writable-stream';
+import CountQueuingStrategy from './count-queuing-strategy';
 
 export default class TransformStream {
   constructor({ transform, flush = (enqueue, close) => close(), inputStrategy, outputStrategy }) {
@@ -9,6 +10,7 @@ export default class TransformStream {
 
     var writeChunk, writeDone, errorInput;
     var transforming = false;
+    var pulled = false;
     var chunkWrittenButNotYetTransformed = false;
     this.input = new WritableStream({
       start(error) {
@@ -19,7 +21,7 @@ export default class TransformStream {
         writeDone = done;
         chunkWrittenButNotYetTransformed = true;
 
-        if (output.state === 'waiting') {
+        if (pulled) {
           maybeDoTransform();
         }
       },
@@ -42,18 +44,25 @@ export default class TransformStream {
         errorOutput = error;
       },
       pull() {
+        pulled = true;
         if (chunkWrittenButNotYetTransformed === true) {
           maybeDoTransform();
         }
       },
-      strategy: outputStrategy
+      strategy: new CountQueuingStrategy({ highWaterMark: 1 })
     });
+
+    function transformEnqueue(chunk) {
+      if (!enqueueInOutput(chunk)) {
+        pulled = false;
+      }
+    }
 
     function maybeDoTransform() {
       if (transforming === false) {
         transforming = true;
         try {
-          transform(writeChunk, enqueueInOutput, transformDone);
+          transform(writeChunk, transformEnqueue, transformDone);
         } catch (e) {
           transforming = false;
           errorInput(e);
