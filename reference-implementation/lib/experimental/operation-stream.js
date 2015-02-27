@@ -175,20 +175,25 @@ class OperationQueue {
 
     this._strategy = strategy;
 
-    this._lastSpace = undefined;
-    this._spaceChangePromise = undefined;
-
     this._window = 0;
 
+    // Writable side.
+
     this._writableState = 'waiting';
+
     this._initWritableReadyPromise();
 
     this._updateWritableState();
 
     this._cancelOperation = undefined;
-    this._cancelledPromise = new Promise((resolve, reject) => {
-      this._resolveCancelledPromise = resolve;
+    this._erroredPromise = new Promise((resolve, reject) => {
+      this._resolveErroredPromise = resolve;
     });
+
+    this._lastSpace = undefined;
+    this._spaceChangePromise = undefined;
+
+    // Readable side.
 
     this._readableState = 'waiting';
     this._initReadableReadyPromise();
@@ -216,18 +221,29 @@ class OperationQueue {
   get writableState() {
     return this._writableState;
   }
-  get writableReady() {
+
+  get writableReleased() {
+    return this._writableReleasedPromise;
+  }
+  get writable() {
     return this._writableReadyPromise;
+  }
+  get errored() {
+    return this._erroredPromise;
+  }
+
+  _throwIfLocked() {
+    if (this._writableState === 'locked') {
+      throw new TypeError('locked');
+    }
   }
 
   get cancelOperation() {
+    this._throwIfLocked();
     return this._cancelOperation;
   }
-  get cancelled() {
-    return this._cancelledPromise;
-  }
 
-  get space() {
+  get _spaceInternal() {
     if (this._writableState === 'closed' ||
         this._writableState === 'aborted' ||
         this._writableState === 'cancelled') {
@@ -240,7 +256,11 @@ class OperationQueue {
 
     return undefined;
   }
-  waitSpaceChange() {
+  get space() {
+    this._throwIfLocked();
+    return this._spaceInternal;
+  }
+  _waitSpaceChangeInternal() {
     if (this._spaceChangePromise !== undefined) {
       return this._spaceChangePromise;
     }
@@ -251,6 +271,10 @@ class OperationQueue {
     this._lastSpace = this.space;
 
     return this._spaceChangePromise;
+  }
+  waitSpaceChange() {
+    this._throwIfLocked();
+    return this._waitSpaceChangeInternal();
   }
 
   _checkWritableState() {
@@ -270,26 +294,39 @@ class OperationQueue {
     if (this._strategy.shouldApplyBackpressure !== undefined) {
       shouldApplyBackpressure = this._strategy.shouldApplyBackpressure(this._queueSize);
     }
+
     if (shouldApplyBackpressure && this._writableState === 'writable') {
+      if (this._writer !== undefined) {
+        this._writer._markWaiting();
+      } else {
+        this._initWritableReadyPromise();
+      }
+
       this._writableState = 'waiting';
-      this._initWritableReadyPromise();
     } else if (!shouldApplyBackpressure && this._writableState === 'waiting') {
+      if (this._writer !== undefined) {
+        this._writer._markWritable();
+      } else {
+        this._resolveWritableReadyPromise();
+      }
+
       this._writableState = 'writable';
-      this._resolveWritableReadyPromise();
     }
 
     if (this._spaceChangePromise !== undefined && this._lastSpace !== this.space) {
-      this._resolveSpaceChangePromise();
+      if (this._writer !== undefined) {
+        this._writer._onSpaceChange();
+      } else {
+        this._resolveSpaceChangePromise();
+        this._spaceChangePromise = undefined;
+        this._resolveSpaceChangePromise = undefined;
+      }
 
       this._lastSpace = undefined;
-      this._spaceChangePromise = undefined;
-      this._resolveSpaceChangePromise = undefined;
     }
   }
 
-  write(argument) {
-    this._checkWritableState();
-
+  _writeInternal() {
     var size = 1;
     if (this._strategy.size !== undefined) {
       size = this._strategy.size(argument);
@@ -308,10 +345,14 @@ class OperationQueue {
 
     return status;
   }
-
-  close() {
+  write(argument) {
+    this._throwIfLocked();
     this._checkWritableState();
 
+    return this._writeInternal(argument);
+  }
+
+  _closeInternal() {
     this._strategy = undefined;
 
     const status = new OperationStatus();
@@ -320,21 +361,20 @@ class OperationQueue {
     this._writableState = 'closed';
 
     if (this._readableState === 'waiting') {
-      this._readableState = 'readable';
       this._resolveReadableReadyPromise();
+      this._readableState = 'readable';
     }
 
     return status;
   }
+  close() {
+    this._throwIfLocked();
+    this._checkWritableState();
 
-  abort(reason) {
-    if (this._writableState === 'aborted') {
-      throw new TypeError('already aborted');
-    }
-    if (this._writableState === 'cancelled') {
-      throw new TypeError('already cancelled');
-    }
+    return this._closeInternal();
+  }
 
+  _abortInternal(reason) {
     for (var i = this._queue.length - 1; i >= 0; --i) {
       const op = this._queue[i].value;
       op.error(new TypeError('aborted'));
@@ -342,8 +382,12 @@ class OperationQueue {
     this._queue = [];
     this._strategy = undefined;
 
-    if (this._writableState === 'waiting') {
-      this._resolveWritableReadyPromise();
+    if (this._writer !== undefined) {
+      this._writer._markAborted();
+    } else {
+      if (this._writableState === 'waiting') {
+        this._resolveWritableReadyPromise();
+      }
     }
     this._writableState = 'aborted';
 
@@ -357,6 +401,117 @@ class OperationQueue {
     this._readableState = 'aborted';
 
     return status;
+  }
+  abort(reason) {
+    this._throwIfLocked();
+    if (this._writableState === 'aborted') {
+      throw new TypeError('already aborted');
+    }
+    if (this._writableState === 'cancelled') {
+      throw new TypeError('already cancelled');
+    }
+
+    this._abortInternal(reason);
+  }
+
+  getWriter() {
+    this._throwIfLocked();
+    if (this._writableState === 'aborted') {
+      throw new TypeError('already aborted');
+    }
+    if (this._writableState === 'cancelled') {
+      throw new TypeError('already cancelled');
+    }
+
+    class ExclusiveOperationStreamWriter {
+      constructor(parent) {
+        this._parent = parent;
+        this._state = this._parent 
+        this._initReadableReadyPromise();
+      }
+
+      _markWaiting() {
+        this._readyPromise = new Promise((resolve, reject) => {
+          this._resolveReadyPromise = resolve;
+        });
+        this._state = 'waiting';
+      }
+
+      _markWritable() {
+        this._resolveReadyPromise();
+        this._state = 'writable';
+      }
+
+      _markClosed() {
+        if (this._readableState === 'waiting') {
+          this._resolveReadableReadyPromise();
+        }
+
+        this._state = 'readable';
+      }
+
+      _markAborted() {
+        if (this._state === 'waiting') {
+          this._resolveWritableReadyPromise();
+        }
+        this._state = 'aborted';
+      }
+
+      _onSpaceChange() {
+        this._resolveSpaceChangePromise();
+        this._spaceChangePromise = undefined;
+        this._resolveSpaceChangePromise = undefined;
+      }
+
+      get state() {
+        return this._state;
+      }
+      get writable() {
+        return this._writablePromise;
+      }
+      get errored() {
+        return this._erroredPromise;
+      }
+
+      _throwIfReleased() {
+        if (this._parent === undefined) {
+          throw new TypeError('released');
+        }
+      }
+
+      get cancelOperation() {
+        this._throwIfReleased();
+        return this._cancelOperation;
+      }
+
+      get space() {
+        this._throwIfReleased();
+        return this._parent._spaceInternal;
+      }
+      waitSpaceChange() {
+        this._throwIfReleased();
+        return this._parent._waitSpaceChangeInternal();
+      }
+
+      write(argument) {
+        this._throwIfReleased();
+        return this._parent._writeInternal(argument);
+      }
+      close() {
+        this._throwIfReleased();
+        return this._parent._closeInternal()
+      }
+      abort(reason) {
+        this._throwIfReleased();
+        return this._parent._abortInternal();
+      }
+    }
+
+    if (this._writableState !== 'waiting') {
+      this._initWritableReadyPromise();
+    }
+    this._writer = new ExclusiveOperationStreamWriter(this);
+    return this._writer;
   }
 
   // Readable side interfaces.
@@ -444,7 +599,7 @@ class OperationQueue {
 
     const status = new OperationStatus();
     this._cancelOperation = new Operation('cancel', reason, status);
-    this._resolveCancelledPromise();
+    this._resolveErroredPromise();
 
     if (this._writableState === 'waiting') {
       this._resolveWritableReadyPromise();
@@ -502,6 +657,11 @@ class OperationQueueWritableSide {
   }
   abort(reason) {
     return this._stream.abort(reason);
+  }
+
+  // Creates a WritableOperationStream implementation representing exclusive access to this WritableOperationStream.
+  getWriter() {
+    return this._stream.getWriter();
   }
 }
 
